@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "riichi-eval"
+version = "0.1.0"
+description = "Duplicate evaluation, mechanism readouts and counterfactual rollouts for riichi mahjong AIs"
+license = { text = "AGPL-3.0-or-later" }
+requires-python = ">=3.10"
+dependencies = ["numpy", "torch"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

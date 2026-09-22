@@ -1,0 +1,573 @@
+diff --git a/libriichi/src/agent/forced.rs b/libriichi/src/agent/forced.rs
+new file mode 100644
+index 0000000..bd3d1cf
+--- /dev/null
++++ b/libriichi/src/agent/forced.rs
+@@ -0,0 +1,183 @@
++//! Forced-prefix wrapper for counterfactual rollouts (riichi-eval).
++//!
++//! A rollout game starts at the beginning of a logged round (same seed, so the
++//! same wall). Until the branch point every seat replays its reaction from the
++//! reference log; at the branch point the branch actor plays a replacement
++//! event; after that every seat is driven by its inner agent.
++use super::{BatchAgent, InvisibleState};
++use crate::arena::GameResult;
++use crate::mjai::{Event, EventExt};
++use crate::state::PlayerState;
++use std::sync::Arc;
++
++use anyhow::{Result, ensure};
++
++/// Shared by the four seats of one rollout game.
++pub struct RolloutScript {
++    /// Events of the start round as logged, beginning with `start_kyoku`.
++    pub reference: Vec<Event>,
++    /// Live log length at which the branch decision is taken.
++    pub branch_pos: usize,
++    pub branch_actor: u8,
++    /// `None` means the branch actor plays freely from the branch point on
++    /// (used for the replay-fidelity control).
++    pub replacement: Option<Event>,
++}
++
++const fn actor_of(ev: &Event) -> Option<u8> {
++    match *ev {
++        Event::Dahai { actor, .. }
++        | Event::Chi { actor, .. }
++        | Event::Pon { actor, .. }
++        | Event::Daiminkan { actor, .. }
++        | Event::Kakan { actor, .. }
++        | Event::Ankan { actor, .. }
++        | Event::Reach { actor }
++        | Event::Hora { actor, .. } => Some(actor),
++        _ => None,
++    }
++}
++
++/// The reaction `actor` took at live log position `pos` in the reference.
++/// Board-generated `reach_accepted` / `dora` may precede the event that
++/// resolves the decision, and simultaneous rons are logged back to back, so
++/// those are skipped; anything else that follows means the actor passed.
++fn reference_reaction(reference: &[Event], pos: usize, actor: u8, state: &PlayerState) -> Event {
++    for ev in reference.iter().skip(pos) {
++        match *ev {
++            Event::Hora {
++                actor: a, target, ..
++            } if a == actor => {
++                return Event::Hora {
++                    actor,
++                    target,
++                    deltas: None,
++                    ura_markers: None,
++                };
++            }
++            Event::Hora { .. } | Event::ReachAccepted { .. } | Event::Dora { .. } => continue,
++            Event::Ryukyoku { .. } => {
++                // Kyuushu kyuuhai is declared by the player on turn; the log
++                // event carries no actor.
++                return if state.last_cans().can_ryukyoku {
++                    Event::Ryukyoku { deltas: None }
++                } else {
++                    Event::None
++                };
++            }
++            _ => {
++                return if actor_of(ev) == Some(actor) {
++                    ev.clone()
++                } else {
++                    Event::None
++                };
++            }
++        }
++    }
++    Event::None
++}
++
++pub struct ForcedPrefixAgent {
++    inner: Box<dyn BatchAgent>,
++    player_ids: Vec<u8>,
++    scripts: Vec<Arc<RolloutScript>>,
++    in_first_kyoku: Vec<bool>,
++    pending: Vec<Option<Event>>,
++}
++
++impl ForcedPrefixAgent {
++    pub fn new(
++        inner: Box<dyn BatchAgent>,
++        player_ids: Vec<u8>,
++        scripts: Vec<Arc<RolloutScript>>,
++    ) -> Result<Self> {
++        ensure!(player_ids.len() == scripts.len());
++        let n = player_ids.len();
++        Ok(Self {
++            inner,
++            player_ids,
++            scripts,
++            in_first_kyoku: vec![false; n],
++            pending: vec![None; n],
++        })
++    }
++}
++
++impl BatchAgent for ForcedPrefixAgent {
++    fn name(&self) -> String {
++        self.inner.name()
++    }
++
++    fn oracle_obs_version(&self) -> Option<u32> {
++        self.inner.oracle_obs_version()
++    }
++
++    fn set_scene(
++        &mut self,
++        index: usize,
++        log: &[EventExt],
++        state: &PlayerState,
++        invisible_state: Option<InvisibleState>,
++    ) -> Result<()> {
++        self.pending[index] = None;
++        if self.in_first_kyoku[index] {
++            let script = &self.scripts[index];
++            let pos = log.len();
++            let actor = self.player_ids[index];
++            let is_branch = pos == script.branch_pos && actor == script.branch_actor;
++            let forced = pos < script.branch_pos || pos == script.branch_pos && !is_branch;
++            if forced || is_branch && script.replacement.is_some() {
++                ensure!(
++                    pos >= 1 && pos <= script.reference.len(),
++                    "rollout: live log length {pos} outside reference (len {})",
++                    script.reference.len(),
++                );
++                ensure!(
++                    log[0].event == script.reference[0],
++                    "rollout: start_kyoku differs from reference (wall/seed mismatch)",
++                );
++                ensure!(
++                    log[pos - 1].event == script.reference[pos - 1],
++                    "rollout: diverged from reference before the branch at log position {pos}: live {:?} vs reference {:?}",
++                    log[pos - 1].event,
++                    script.reference[pos - 1],
++                );
++                let ev = if forced {
++                    reference_reaction(&script.reference, pos, actor, state)
++                } else {
++                    script.replacement.clone().unwrap_or_default()
++                };
++                self.pending[index] = Some(ev);
++                return Ok(());
++            }
++        }
++        self.inner.set_scene(index, log, state, invisible_state)
++    }
++
++    fn get_reaction(
++        &mut self,
++        index: usize,
++        log: &[EventExt],
++        state: &PlayerState,
++        invisible_state: Option<InvisibleState>,
++    ) -> Result<EventExt> {
++        if let Some(ev) = self.pending[index].take() {
++            return Ok(EventExt::no_meta(ev));
++        }
++        self.inner.get_reaction(index, log, state, invisible_state)
++    }
++
++    fn start_game(&mut self, index: usize) -> Result<()> {
++        self.in_first_kyoku[index] = true;
++        self.inner.start_game(index)
++    }
++
++    fn end_kyoku(&mut self, index: usize) -> Result<()> {
++        self.in_first_kyoku[index] = false;
++        self.inner.end_kyoku(index)
++    }
++
++    fn end_game(&mut self, index: usize, game_result: &GameResult) -> Result<()> {
++        self.inner.end_game(index, game_result)
++    }
++}
+diff --git a/libriichi/src/agent/mod.rs b/libriichi/src/agent/mod.rs
+index 7a9ea7f..69e15e0 100644
+--- a/libriichi/src/agent/mod.rs
++++ b/libriichi/src/agent/mod.rs
+@@ -1,6 +1,7 @@
+ mod akochan;
+ mod batchify;
+ mod defs;
++mod forced;
+ mod mjai_log;
+ mod mortal;
+ mod py_agent;
+@@ -9,6 +10,7 @@ mod tsumogiri;
+ pub use akochan::AkochanAgent;
+ pub use batchify::BatchifiedAgent;
+ pub use defs::{Agent, BatchAgent, InvisibleState};
++pub use forced::{ForcedPrefixAgent, RolloutScript};
+ pub use mjai_log::MjaiLogBatchAgent;
+ pub use mortal::MortalBatchAgent;
+ pub use py_agent::new_py_agent;
+diff --git a/libriichi/src/arena/game.rs b/libriichi/src/arena/game.rs
+index 9fee2df..2021302 100644
+--- a/libriichi/src/arena/game.rs
++++ b/libriichi/src/arena/game.rs
+@@ -5,7 +5,7 @@ use crate::mjai::EventExt;
+ use std::time::Duration;
+ use std::{array, mem};
+ 
+-use anyhow::{Result, ensure};
++use anyhow::{Context, Result, ensure};
+ use indicatif::{ProgressBar, ProgressStyle};
+ use ndarray::prelude::*;
+ 
+@@ -16,6 +16,29 @@ pub struct BatchGame {
+     pub disable_progress_bar: bool,
+ }
+ 
++/// Start state for a game that does not begin at E1 with equal scores
++/// (counterfactual rollouts). The wall of every kyoku still comes from the
++/// game seed and (kyoku, honba), exactly as in a normal game.
++#[derive(Clone, Copy, Default)]
++pub struct GameInit {
++    pub kyoku: u8,
++    pub honba: u8,
++    pub kyotaku: u8,
++    pub scores: [i32; 4],
++    pub in_renchan: bool,
++    /// End the game right after the first kyoku (round-horizon rollouts).
++    pub stop_after_first_kyoku: bool,
++}
++
++/// State right after the first kyoku of the game.
++#[derive(Clone, Copy, Debug)]
++pub struct FirstKyokuEnd {
++    pub scores: [i32; 4],
++    pub kyotaku: u8,
++    /// (kyoku, honba) of the kyoku that follows, `None` if the game ended.
++    pub next: Option<(u8, u8)>,
++}
++
+ #[derive(Clone, Copy, Default)]
+ pub struct Index {
+     /// For `Game` to find a specific `Agent` (game -> agent).
+@@ -52,6 +75,10 @@ struct Game {
+     /// > サドンデスルールは、30000点(供託未収)以上になった時点で終了、ただし親の
+     /// > 連荘がある場合は連荘を優先する
+     in_renchan: bool,
++
++    stop_after_first_kyoku: bool,
++    first_kyoku_end: Option<([i32; 4], u8)>,
++    next_after_first: Option<(u8, u8)>,
+ }
+ 
+ impl Game {
+@@ -75,6 +102,14 @@ impl Game {
+                 return Ok(());
+             }
+ 
++            if self.first_kyoku_end.is_some() && self.next_after_first.is_none() {
++                self.next_after_first = Some((self.kyoku, self.honba));
++                if self.stop_after_first_kyoku {
++                    self.ended = true;
++                    return Ok(());
++                }
++            }
++
+             let mut next_board = Board {
+                 kyoku: self.kyoku,
+                 honba: self.honba,
+@@ -126,6 +161,10 @@ impl Game {
+                 let logs = self.board.take_log();
+                 self.game_log.push(logs);
+ 
++                if self.first_kyoku_end.is_none() {
++                    self.first_kyoku_end = Some((self.scores, self.kyotaku));
++                }
++
+                 let has_tobi = self.scores.iter().any(|&s| s < 0);
+                 if has_tobi {
+                     self.ended = true;
+@@ -233,6 +272,19 @@ impl BatchGame {
+         indexes: &[[Index; 4]],
+         seeds: &[(u64, u64)],
+     ) -> Result<Vec<GameResult>> {
++        let results = self.run_with_init(agents, indexes, seeds, None)?;
++        Ok(results.into_iter().map(|(r, _)| r).collect())
++    }
++
++    /// Like `run`, but each game may start from `inits[i]` instead of E1.
++    /// Also returns the scores right after each game's first kyoku.
++    pub fn run_with_init(
++        &self,
++        agents: &mut [Box<dyn BatchAgent>],
++        indexes: &[[Index; 4]],
++        seeds: &[(u64, u64)],
++        inits: Option<&[GameInit]>,
++    ) -> Result<Vec<(GameResult, Option<FirstKyokuEnd>)>> {
+         ensure!(!agents.is_empty());
+         ensure!(!indexes.is_empty());
+         ensure!(
+@@ -241,6 +293,9 @@ impl BatchGame {
+             indexes.len(),
+             seeds.len(),
+         );
++        if let Some(inits) = inits {
++            ensure!(inits.len() == seeds.len(), "expected one GameInit per game");
++        }
+ 
+         let mut games = indexes
+             .iter()
+@@ -253,7 +308,7 @@ impl BatchGame {
+                     oracle_obs_versions[i] = agents[idx.agent_idx].oracle_obs_version();
+                 }
+ 
+-                let game = Box::new(Game {
++                let mut game = Box::new(Game {
+                     length: self.length,
+                     seed,
+                     indexes: *idxs,
+@@ -261,11 +316,19 @@ impl BatchGame {
+                     oracle_obs_versions,
+                     ..Default::default()
+                 });
++                if let Some(init) = inits.map(|v| v[game_idx]) {
++                    game.kyoku = init.kyoku;
++                    game.honba = init.honba;
++                    game.kyotaku = init.kyotaku;
++                    game.scores = init.scores;
++                    game.in_renchan = init.in_renchan;
++                    game.stop_after_first_kyoku = init.stop_after_first_kyoku;
++                }
+                 Ok((game_idx, game))
+             })
+             .collect::<Result<Vec<_>>>()?;
+ 
+-        let mut game_results = vec![GameResult::default(); games.len()];
++        let mut game_results = vec![(GameResult::default(), None); games.len()];
+         let mut to_remove = vec![];
+         let mut cycles = 0;
+         let mut actions = 0;
+@@ -284,13 +347,22 @@ impl BatchGame {
+         bar.enable_steady_tick(Duration::from_millis(150));
+ 
+         while !games.is_empty() {
+-            for (_, game) in &mut games {
+-                game.poll(agents)?;
++            for (game_idx, game) in &mut games {
++                game.poll(agents)
++                    .with_context(|| format!("game #{game_idx}"))?;
+             }
+ 
+             for (idx_for_rm, (game_idx, game)) in games.iter_mut().enumerate() {
+-                if let Some(game_result) = game.commit(agents)? {
+-                    game_results[*game_idx] = game_result;
++                if let Some(game_result) = game
++                    .commit(agents)
++                    .with_context(|| format!("game #{game_idx}"))?
++                {
++                    let first = game.first_kyoku_end.map(|(scores, kyotaku)| FirstKyokuEnd {
++                        scores,
++                        kyotaku,
++                        next: game.next_after_first,
++                    });
++                    game_results[*game_idx] = (game_result, first);
+                     to_remove.push(idx_for_rm);
+                 }
+             }
+diff --git a/libriichi/src/arena/mod.rs b/libriichi/src/arena/mod.rs
+index 880cf87..36f8def 100644
+--- a/libriichi/src/arena/mod.rs
++++ b/libriichi/src/arena/mod.rs
+@@ -2,6 +2,7 @@ mod board;
+ mod game;
+ mod one_vs_three;
+ mod result;
++mod rollout;
+ mod two_vs_two;
+ 
+ pub use board::Board;
+@@ -9,6 +10,7 @@ pub use result::GameResult;
+ 
+ use crate::py_helper::add_submodule;
+ use one_vs_three::OneVsThree;
++use rollout::Rollout;
+ use two_vs_two::TwoVsTwo;
+ 
+ use pyo3::prelude::*;
+@@ -21,5 +23,6 @@ pub(crate) fn register_module(
+     let m = PyModule::new(py, "arena")?;
+     m.add_class::<OneVsThree>()?;
+     m.add_class::<TwoVsTwo>()?;
++    m.add_class::<Rollout>()?;
+     add_submodule(py, prefix, super_mod, &m)
+ }
+diff --git a/libriichi/src/arena/rollout.rs b/libriichi/src/arena/rollout.rs
+new file mode 100644
+index 0000000..38e7066
+--- /dev/null
++++ b/libriichi/src/arena/rollout.rs
+@@ -0,0 +1,164 @@
++//! Counterfactual rollouts for riichi-eval.
++//!
++//! Each spec restarts a logged game at the beginning of one kyoku (same seed,
++//! hence the same wall), replays the logged reactions up to a branch point,
++//! lets the branch actor play a replacement event, and continues with the
++//! given engines until the end of that kyoku or of the game.
++use super::game::{BatchGame, GameInit, Index};
++use crate::agent::{BatchAgent, ForcedPrefixAgent, RolloutScript, new_py_agent};
++use crate::mjai::{Event, EventExt};
++use std::sync::Arc;
++
++use anyhow::{Context, Result, bail, ensure};
++use pyo3::prelude::*;
++use serde_json as json;
++
++#[derive(FromPyObject)]
++#[pyo3(from_item_all)]
++pub struct RolloutSpec {
++    /// (nonce, key) from the logged `start_game`.
++    seed: (u64, u64),
++    /// 0-based kyoku index of the whole game (E1 = 0, S1 = 4, W1 = 8).
++    kyoku: u8,
++    honba: u8,
++    kyotaku: u8,
++    scores: [i32; 4],
++    in_renchan: bool,
++    /// Index into `engines` for each seat.
++    seat_engines: [usize; 4],
++    /// Logged events of that kyoku as JSON lines, from `start_kyoku` on.
++    reference: Vec<String>,
++    branch_pos: usize,
++    branch_actor: u8,
++    /// Replacement reaction as mjai JSON; `None` = play freely from the branch.
++    replacement: Option<String>,
++    /// "kyoku" or "game".
++    horizon: String,
++}
++
++#[pyclass]
++#[derive(Clone, Default)]
++pub struct Rollout {
++    pub disable_progress_bar: bool,
++}
++
++fn parse_event(line: &str) -> Result<Event> {
++    let ext: EventExt = json::from_str(line).with_context(|| format!("bad mjai json: {line}"))?;
++    Ok(ext.event)
++}
++
++#[pymethods]
++impl Rollout {
++    #[new]
++    #[pyo3(signature = (*, disable_progress_bar=true))]
++    const fn new(disable_progress_bar: bool) -> Self {
++        Self {
++            disable_progress_bar,
++        }
++    }
++
++    /// Returns, per spec: (json log, final scores, scores after the first
++    /// kyoku, kyotaku left after it, (kyoku, honba) of the next kyoku or
++    /// `None` if the game ended there).
++    #[allow(clippy::type_complexity)]
++    pub fn run(
++        &self,
++        engines: Vec<PyObject>,
++        specs: Vec<RolloutSpec>,
++        py: Python<'_>,
++    ) -> Result<Vec<(String, [i32; 4], [i32; 4], u8, Option<(u8, u8)>)>> {
++        ensure!(!engines.is_empty(), "no engines");
++        ensure!(!specs.is_empty(), "no specs");
++
++        let n_engines = engines.len();
++        let mut player_ids: Vec<Vec<u8>> = vec![vec![]; n_engines];
++        let mut scripts: Vec<Vec<Arc<RolloutScript>>> = vec![vec![]; n_engines];
++        let mut indexes = Vec::with_capacity(specs.len());
++        let mut seeds = Vec::with_capacity(specs.len());
++        let mut inits = Vec::with_capacity(specs.len());
++
++        for (i, spec) in specs.iter().enumerate() {
++            let reference = spec
++                .reference
++                .iter()
++                .map(|l| parse_event(l))
++                .collect::<Result<Vec<_>>>()
++                .with_context(|| format!("spec #{i}"))?;
++            ensure!(
++                matches!(reference.first(), Some(Event::StartKyoku { .. })),
++                "spec #{i}: reference must start with start_kyoku",
++            );
++            let replacement = spec
++                .replacement
++                .as_deref()
++                .map(parse_event)
++                .transpose()
++                .with_context(|| format!("spec #{i}"))?;
++            let stop_after_first_kyoku = match spec.horizon.as_str() {
++                "kyoku" => true,
++                "game" => false,
++                h => bail!("spec #{i}: unknown horizon {h}"),
++            };
++            let script = Arc::new(RolloutScript {
++                reference,
++                branch_pos: spec.branch_pos,
++                branch_actor: spec.branch_actor,
++                replacement,
++            });
++
++            let mut idxs = [Index::default(); 4];
++            for (seat, &e) in spec.seat_engines.iter().enumerate() {
++                ensure!(e < n_engines, "spec #{i}: engine index {e} out of range");
++                idxs[seat] = Index {
++                    agent_idx: e,
++                    player_id_idx: player_ids[e].len(),
++                };
++                player_ids[e].push(seat as u8);
++                scripts[e].push(Arc::clone(&script));
++            }
++            indexes.push(idxs);
++            seeds.push(spec.seed);
++            inits.push(GameInit {
++                kyoku: spec.kyoku,
++                honba: spec.honba,
++                kyotaku: spec.kyotaku,
++                scores: spec.scores,
++                in_renchan: spec.in_renchan,
++                stop_after_first_kyoku,
++            });
++        }
++
++        let batch_game = BatchGame {
++            length: 8,
++            init_scores: [25000; 4],
++            disable_progress_bar: self.disable_progress_bar,
++        };
++
++        py.allow_threads(move || {
++            let mut agents = engines
++                .into_iter()
++                .zip(player_ids)
++                .zip(scripts)
++                .map(|((engine, ids), scr)| {
++                    let inner = new_py_agent(engine, &ids)?;
++                    Ok(Box::new(ForcedPrefixAgent::new(inner, ids, scr)?) as Box<dyn BatchAgent>)
++                })
++                .collect::<Result<Vec<_>>>()?;
++
++            let results = batch_game.run_with_init(&mut agents, &indexes, &seeds, Some(&inits))?;
++            results
++                .into_iter()
++                .map(|(r, first)| {
++                    let first = first.context("rollout game ended before its first kyoku")?;
++                    Ok((
++                        r.dump_json_log()?,
++                        r.scores,
++                        first.scores,
++                        first.kyotaku,
++                        first.next,
++                    ))
++                })
++                .collect()
++        })
++    }
++}
