@@ -1,9 +1,9 @@
 diff --git a/libriichi/src/agent/forced.rs b/libriichi/src/agent/forced.rs
 new file mode 100644
-index 0000000..bd3d1cf
+index 0000000..c14b901
 --- /dev/null
 +++ b/libriichi/src/agent/forced.rs
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,303 @@
 +//! Forced-prefix wrapper for counterfactual rollouts (riichi-eval).
 +//!
 +//! A rollout game starts at the beginning of a logged round (same seed, so the
@@ -12,11 +12,25 @@ index 0000000..bd3d1cf
 +//! event; after that every seat is driven by its inner agent.
 +use super::{BatchAgent, InvisibleState};
 +use crate::arena::GameResult;
-+use crate::mjai::{Event, EventExt};
++use crate::mjai::{Event, EventExt, Metadata};
++use crate::must_tile;
 +use crate::state::PlayerState;
 +use std::sync::Arc;
 +
 +use anyhow::{Result, ensure};
++
++/// A macro-action the branch actor keeps to after its replacement, for the
++/// rest of the branch kyoku, on top of its inner agent's choices.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum Commit {
++    #[default]
++    None,
++    /// Betaori: whenever a genbutsu discard is legal, discard the one the
++    /// inner agent values most; never riichi, call or kan; agari is kept.
++    Fold,
++    /// Never declare riichi.
++    Dama,
++}
 +
 +/// Shared by the four seats of one rollout game.
 +pub struct RolloutScript {
@@ -28,6 +42,7 @@ index 0000000..bd3d1cf
 +    /// `None` means the branch actor plays freely from the branch point on
 +    /// (used for the replay-fidelity control).
 +    pub replacement: Option<Event>,
++    pub commit: Commit,
 +}
 +
 +const fn actor_of(ev: &Event) -> Option<u8> {
@@ -81,6 +96,101 @@ index 0000000..bd3d1cf
 +        }
 +    }
 +    Event::None
++}
++
++/// Genbutsu kinds for `me` against every opponent whose riichi is accepted
++/// (their own discards plus tiles passed after their riichi), intersected;
++/// `None` if no opponent is in riichi. Mirrors `riichi_eval.replay`.
++fn genbutsu(log: &[EventExt], me: u8) -> Option<[bool; 34]> {
++    let mut riichi = [false; 4];
++    let mut safe = [[false; 34]; 4];
++    for ev in log {
++        match ev.event {
++            Event::Dahai { actor, pai, .. } => {
++                let k = pai.deaka().as_usize();
++                safe[actor as usize][k] = true;
++                for o in 0..4 {
++                    if riichi[o] && o != actor as usize {
++                        safe[o][k] = true;
++                    }
++                }
++            }
++            Event::ReachAccepted { actor } => riichi[actor as usize] = true,
++            _ => (),
++        }
++    }
++    let mut out = [true; 34];
++    let mut any = false;
++    for o in (0..4).filter(|&o| o != me as usize && riichi[o]) {
++        any = true;
++        for (x, &y) in out.iter_mut().zip(&safe[o]) {
++            *x &= y;
++        }
++    }
++    any.then_some(out)
++}
++
++/// The legal action with the highest Q among those `allow` admits, from the
++/// inner agent's metadata (compact Q values over the set mask bits).
++fn best_of(meta: &Metadata, allow: impl Fn(usize) -> bool) -> Option<usize> {
++    let (q, bits) = (meta.q_values.as_ref()?, meta.mask_bits?);
++    let mut best: Option<(usize, f32)> = None;
++    for (a, &v) in (0..64).filter(|a| bits >> a & 1 == 1).zip(q) {
++        if allow(a) && best.is_none_or(|(_, b)| v > b) {
++            best = Some((a, v));
++        }
++    }
++    best.map(|(a, _)| a)
++}
++
++fn apply_commit(
++    commit: Commit,
++    actor: u8,
++    log: &[EventExt],
++    state: &PlayerState,
++    ext: EventExt,
++) -> EventExt {
++    let Some(meta) = ext.meta.as_ref() else {
++        // quick-eval reaction: the only legal discard, nothing to choose
++        return ext;
++    };
++    let discard = |a: usize| {
++        let pai = must_tile!(a);
++        let tsumogiri = state.last_self_tsumo().is_some_and(|t| t == pai);
++        Event::Dahai {
++            actor,
++            pai,
++            tsumogiri,
++        }
++    };
++    let replace = match (commit, &ext.event) {
++        (Commit::None, _) | (_, Event::Hora { .. }) => None,
++        (Commit::Dama, Event::Reach { .. }) => best_of(meta, |a| a <= 36).map(discard),
++        (Commit::Dama, _) => None,
++        (Commit::Fold, ev) if state.last_cans().can_discard => {
++            let safe = genbutsu(log, actor);
++            let is_safe = |a: usize| a <= 36 && safe.is_some_and(|s| s[must_tile!(a).deaka().as_usize()]);
++            match ev {
++                Event::Dahai { pai, .. } if safe.is_some_and(|s| s[pai.deaka().as_usize()]) => None,
++                // a non-genbutsu discard: swap for the best genbutsu if any is legal
++                Event::Dahai { .. } => best_of(meta, is_safe).map(discard),
++                // riichi / kan: best genbutsu, else the best plain discard
++                _ => best_of(meta, is_safe)
++                    .or_else(|| best_of(meta, |a| a <= 36))
++                    .map(discard),
++            }
++        }
++        (Commit::Fold, Event::None) => None,
++        // a call offered on someone else's discard: decline
++        (Commit::Fold, _) => Some(Event::None),
++    };
++    match replace {
++        Some(event) => EventExt {
++            event,
++            meta: ext.meta,
++        },
++        None => ext,
++    }
 +}
 +
 +pub struct ForcedPrefixAgent {
@@ -170,7 +280,17 @@ index 0000000..bd3d1cf
 +        if let Some(ev) = self.pending[index].take() {
 +            return Ok(EventExt::no_meta(ev));
 +        }
-+        self.inner.get_reaction(index, log, state, invisible_state)
++        let ext = self.inner.get_reaction(index, log, state, invisible_state)?;
++        let script = &self.scripts[index];
++        let actor = self.player_ids[index];
++        if self.in_first_kyoku[index]
++            && script.commit != Commit::None
++            && actor == script.branch_actor
++            && log.len() > script.branch_pos
++        {
++            return Ok(apply_commit(script.commit, actor, log, state, ext));
++        }
++        Ok(ext)
 +    }
 +
 +    fn start_game(&mut self, index: usize) -> Result<()> {
@@ -188,7 +308,7 @@ index 0000000..bd3d1cf
 +    }
 +}
 diff --git a/libriichi/src/agent/mod.rs b/libriichi/src/agent/mod.rs
-index 7a9ea7f..69e15e0 100644
+index 7a9ea7f..f8d31b4 100644
 --- a/libriichi/src/agent/mod.rs
 +++ b/libriichi/src/agent/mod.rs
 @@ -1,6 +1,7 @@
@@ -203,7 +323,7 @@ index 7a9ea7f..69e15e0 100644
  pub use akochan::AkochanAgent;
  pub use batchify::BatchifiedAgent;
  pub use defs::{Agent, BatchAgent, InvisibleState};
-+pub use forced::{ForcedPrefixAgent, RolloutScript};
++pub use forced::{Commit, ForcedPrefixAgent, RolloutScript};
  pub use mjai_log::MjaiLogBatchAgent;
  pub use mortal::MortalBatchAgent;
  pub use py_agent::new_py_agent;
@@ -403,10 +523,10 @@ index 880cf87..36f8def 100644
  }
 diff --git a/libriichi/src/arena/rollout.rs b/libriichi/src/arena/rollout.rs
 new file mode 100644
-index 0000000..38e7066
+index 0000000..6237ad6
 --- /dev/null
 +++ b/libriichi/src/arena/rollout.rs
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,178 @@
 +//! Counterfactual rollouts for riichi-eval.
 +//!
 +//! Each spec restarts a logged game at the beginning of one kyoku (same seed,
@@ -414,7 +534,7 @@ index 0000000..38e7066
 +//! lets the branch actor play a replacement event, and continues with the
 +//! given engines until the end of that kyoku or of the game.
 +use super::game::{BatchGame, GameInit, Index};
-+use crate::agent::{BatchAgent, ForcedPrefixAgent, RolloutScript, new_py_agent};
++use crate::agent::{BatchAgent, Commit, ForcedPrefixAgent, RolloutScript, new_py_agent};
 +use crate::mjai::{Event, EventExt};
 +use std::sync::Arc;
 +
@@ -443,6 +563,9 @@ index 0000000..38e7066
 +    replacement: Option<String>,
 +    /// "kyoku" or "game".
 +    horizon: String,
++    /// "" (none), "fold" or "dama": a macro-action the branch actor keeps to
++    /// for the rest of the branch kyoku (see `Commit`).
++    commit: String,
 +}
 +
 +#[pyclass]
@@ -458,6 +581,10 @@ index 0000000..38e7066
 +
 +#[pymethods]
 +impl Rollout {
++    /// Lets Python refuse a `commit` spec on a build that would ignore it.
++    #[classattr]
++    const SUPPORTS_COMMIT: bool = true;
++
 +    #[new]
 +    #[pyo3(signature = (*, disable_progress_bar=true))]
 +    const fn new(disable_progress_bar: bool) -> Self {
@@ -508,11 +635,18 @@ index 0000000..38e7066
 +                "game" => false,
 +                h => bail!("spec #{i}: unknown horizon {h}"),
 +            };
++            let commit = match spec.commit.as_str() {
++                "" | "none" => Commit::None,
++                "fold" => Commit::Fold,
++                "dama" => Commit::Dama,
++                c => bail!("spec #{i}: unknown commit {c}"),
++            };
 +            let script = Arc::new(RolloutScript {
 +                reference,
 +                branch_pos: spec.branch_pos,
 +                branch_actor: spec.branch_actor,
 +                replacement,
++                commit,
 +            });
 +
 +            let mut idxs = [Index::default(); 4];

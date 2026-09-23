@@ -71,6 +71,8 @@ def main():
     ap.add_argument("--batch", type=int, default=2048)
     ap.add_argument("--out", required=True)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--commit", action="store_true",
+                    help="price the alternative as a macro-action: keep folding / keep dama for the rest of the kyoku")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -96,14 +98,15 @@ def main():
         paths = [p for _, ps in chunk for p in ps]
         games = [read_game(p) for p in paths]
         seats = [next(i for i, n in enumerate(g.names) if n != args.ref_name) for g in games]
-        cands, pcc = find_candidates(games, seats, ours)
+        cands, pcc = find_candidates(games, seats, ours, ref_engine=ref)
         pc[0] += pcc[0]
         pc[1] += pcc[1]
-        priced = price(games, seats, cands, ours, ref, grp=grp, batch=args.batch)
+        priced = price(games, seats, cands, ours, ref, grp=grp, batch=args.batch, commit=args.commit)
         with open(cpath, "a") as f:
             for cd in priced:
                 row = {k: getattr(cd, k) for k in ("r", "pos", "actor", "kind", "ours", "alt", "margin",
-                                                    "exposed", "shanten", "opened", "turn", "n_riichi", "dora")}
+                                                    "exposed", "shanten", "opened", "turn", "n_riichi", "dora",
+                                                    "ref_flip", "ref_margin")}
                 row["seed"], row["rot"] = chunk[cd.game // 4][0], "abcd"[cd.game % 4]
                 if cd.alt_ev:
                     row.update({"d_grp": cd.alt_ev.get("grp"), "d_raw": cd.alt_ev.get("raw")})
@@ -133,6 +136,19 @@ def main():
         t_at = [x for x in test if x[0] == best[0]][0]
         print(f"  split-half: tau*={best[0]:g} fitted on half the seeds -> other half gain "
               f"{t_at[2]:+.3f} ± {t_at[3]:.3f} pt/game ({t_at[1]:.2f} flips/game)")
+        if any(r.get("ref_flip") is not None for r in rk):
+            # Diagnostic only: where would the reference engine also have folded / stayed dama?
+            print(f"  by what {args.ref_name} would do at the same state (all margins):")
+            for lab, sel in (("ref would also flip", True), ("ref would do as we did", False)):
+                sub = [r for r in rk if r.get("ref_flip") is sel]
+                tau, rate, g, ci = gain_curve(sub, "d_grp", seeds_keep=seeds)[-1]
+                print(f"    {lab:<24}{rate:>8.2f} flips/game  gain {g:+.3f} ± {ci:.3f} pt/game  "
+                      f"({g / rate if rate else float('nan'):+.3f} pt/flip)")
+            sub = [r for r in rk if r.get("ref_flip")]
+            print(f"    ...and within 'ref would also flip', gated by our own margin:")
+            for tau, rate, g, ci in gain_curve(sub, "d_grp", seeds_keep=seeds):
+                if tau in (0.1, 0.3, 0.5, 1.0, 2.0):
+                    print(f"      tau {tau:>4.1f}: {rate:.2f} flips/game, gain {g:+.3f} ± {ci:.3f}")
     print(f"\n-> {cpath}")
 
 

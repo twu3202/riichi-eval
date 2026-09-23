@@ -43,6 +43,11 @@ class GameLog:
 def read_game(path: str) -> GameLog:
     with gzip.open(path, "rt", encoding="utf-8") as f:
         lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+    return parse_game(lines, path)
+
+
+def parse_game(lines: list[str], path: str = "") -> GameLog:
+    """A GameLog from mjai JSON lines (start_game first), e.g. a rollout's log with meta stripped."""
     head = json.loads(lines[0])
     if head.get("type") != "start_game":
         raise ValueError(f"{path}: first event is not start_game")
