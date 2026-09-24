@@ -10,6 +10,12 @@ Two candidate sets:
     (non-genbutsu discard, or riichi) and a genbutsu discard was legal; the alternative is our own best genbutsu.
   - **riichi→dama**: we declared riichi; the alternative is our own best discard.
 
+Two reverse sets (for training labels, so both sides of each decision get priced):
+  - **fold→push**: an exposed decision where we discarded a genbutsu and a non-genbutsu discard was legal;
+    the alternative is our own best non-genbutsu discard.
+  - **dama→riichi**: riichi was legal and we discarded without it; the alternative is riichi (our model then
+    picks the riichi tile).
+
 Each candidate also carries `margin` = Q_ours[what we did] − Q_ours[alternative] ≥ 0, so a rule "flip when
 margin < τ" can be scored offline for any τ. Flips are priced one at a time, so the total for a τ is a
 first-order estimate of applying the rule everywhere; a real engine-level eval is the confirmation step.
@@ -46,7 +52,7 @@ class Candidate:
     r: int
     pos: int
     actor: int
-    kind: str          # "push2fold" | "riichi2dama"
+    kind: str          # "push2fold" | "riichi2dama" | "fold2push" | "dama2riichi"
     ours: int
     alt: int
     margin: float
@@ -62,8 +68,12 @@ class Candidate:
     ref_margin: float | None = None  # Q_ref[ours] − Q_ref[alt]
 
 
+KINDS = ("push2fold", "riichi2dama")
+ALL_KINDS = ("push2fold", "riichi2dama", "fold2push", "dama2riichi")
+
+
 def find_candidates(games: list[GameLog], seats: list[int], engine, version: int = 4, batch: int = 4096,
-                    ref_engine=None):
+                    ref_engine=None, kinds=KINDS):
     decs, owner = [], []
     for gi, (g, seat) in enumerate(zip(games, seats)):
         for d in iter_decisions(g, [seat], version):
@@ -90,14 +100,20 @@ def find_candidates(games: list[GameLog], seats: list[int], engine, version: int
                                      d.n_riichi, d.dora, ev))
                 cdec.append(d)
 
-        if d.logged == 37:
+        if d.logged == 37 and "riichi2dama" in kinds:
             disc = [a for a in range(37) if d.mask[a]]
             if disc:
                 add("riichi2dama", max(disc, key=lambda a: qv[a]))
-        if d.exposed and d.push_fold(d.logged) == "push":
+        if d.exposed and d.push_fold(d.logged) == "push" and "push2fold" in kinds:
             safe = [a for a in range(37) if d.mask[a] and d.push_fold(a) == "fold"]
             if safe:
                 add("push2fold", max(safe, key=lambda a: qv[a]))
+        if d.exposed and d.push_fold(d.logged) == "fold" and "fold2push" in kinds:
+            push = [a for a in range(37) if d.mask[a] and d.push_fold(a) == "push"]
+            if push:
+                add("fold2push", max(push, key=lambda a: qv[a]))
+        if d.mask[37] and 0 <= d.logged <= 36 and "dama2riichi" in kinds:
+            add("dama2riichi", 37)
     if ref_engine is not None and cdec:
         rq = []
         for s in range(0, len(cdec), batch):
@@ -107,9 +123,14 @@ def find_candidates(games: list[GameLog], seats: list[int], engine, version: int
             qv = np.asarray(qv, np.float64)
             qv[~d.mask] = -np.inf
             best = int(qv.argmax())
-            c.ref_flip = best != 37 if c.kind == "riichi2dama" else d.push_fold(best) == "fold"
+            c.ref_flip = {"riichi2dama": best != 37, "dama2riichi": best == 37,
+                          "push2fold": d.push_fold(best) == "fold",
+                          "fold2push": d.push_fold(best) == "push"}[c.kind]
             c.ref_margin = float(qv[c.ours] - qv[c.alt])
     return out, pc
+
+
+COMMIT = {"push2fold": "fold", "riichi2dama": "dama"}   # the reverse kinds have no macro-action
 
 
 def price(games, seats, cands: list[Candidate], ours_engine, ref_engine, *, grp: GrpValuer | None = None,
@@ -122,7 +143,7 @@ def price(games, seats, cands: list[Candidate], ours_engine, ref_engine, *, grp:
         specs.append(kyoku_spec(g, c.r, seat_engines=[0 if s == seat else 1 for s in range(4)],
                                 branch_pos=c.pos, branch_actor=c.actor,
                                 replacement=json.dumps(c.alt_event), horizon="kyoku",
-                                commit=("fold" if c.kind == "push2fold" else "dama") if commit else ""))
+                                commit=COMMIT.get(c.kind, "") if commit else ""))
         keep.append(c)
     res = driver.run([ours_engine, ref_engine], specs, batch=batch) if specs else []
     grp_q, grp_seat, grp_key = [], [], []

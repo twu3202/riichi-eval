@@ -23,7 +23,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 from riichi_eval.engines.mortal import cap_gpu_mem, load_mortal  # noqa: E402
 from riichi_eval.logs import NAME_RE, read_game  # noqa: E402
-from riichi_eval.rollout.probe import find_candidates, price  # noqa: E402
+from riichi_eval.rollout.probe import ALL_KINDS, KINDS, find_candidates, price  # noqa: E402
 from riichi_eval.rollout.value import GrpValuer  # noqa: E402
 
 TAUS = [0.0, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 1e9]
@@ -73,7 +73,12 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--commit", action="store_true",
                     help="price the alternative as a macro-action: keep folding / keep dama for the rest of the kyoku")
+    ap.add_argument("--kinds", default=",".join(KINDS),
+                    help=f"comma list from {','.join(ALL_KINDS)} (all four = rollout labels for training)")
     args = ap.parse_args()
+    kinds = tuple(k for k in args.kinds.split(",") if k)
+    if not set(kinds) <= set(ALL_KINDS):
+        sys.exit(f"unknown kinds: {set(kinds) - set(ALL_KINDS)}")
 
     os.makedirs(args.out, exist_ok=True)
     groups = complete_groups(args.log_dir)
@@ -98,7 +103,7 @@ def main():
         paths = [p for _, ps in chunk for p in ps]
         games = [read_game(p) for p in paths]
         seats = [next(i for i, n in enumerate(g.names) if n != args.ref_name) for g in games]
-        cands, pcc = find_candidates(games, seats, ours, ref_engine=ref)
+        cands, pcc = find_candidates(games, seats, ours, ref_engine=ref, kinds=kinds)
         pc[0] += pcc[0]
         pc[1] += pcc[1]
         priced = price(games, seats, cands, ours, ref, grp=grp, batch=args.batch, commit=args.commit)
@@ -118,10 +123,9 @@ def main():
     rows = [json.loads(ln) for ln in open(cpath)]
     seeds = sorted({r["seed"] for r in rows})
     n_games = 4 * len(seeds)
-    print(f"\n{n_games:,} games, {len(rows):,} priced flips "
-          f"({sum(1 for r in rows if r['kind'] == 'push2fold') / n_games:.2f} push→fold, "
-          f"{sum(1 for r in rows if r['kind'] == 'riichi2dama') / n_games:.2f} riichi→dama per game)")
-    for kind in ("push2fold", "riichi2dama", "both"):
+    print(f"\n{n_games:,} games, {len(rows):,} priced flips ("
+          + ", ".join(f"{sum(1 for r in rows if r['kind'] == k) / n_games:.2f} {k}" for k in kinds) + " per game)")
+    for kind in (*kinds, "both"):
         rk = rows if kind == "both" else [r for r in rows if r["kind"] == kind]
         if not rk:
             continue

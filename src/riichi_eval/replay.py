@@ -77,8 +77,10 @@ def _logged_action(events: list[dict], j: int, me: int, cans) -> int:
     return 45 if cans.can_pass else -1
 
 
-def iter_decisions(game: GameLog, seats, version: int = 4):
-    """Every can-act point of the given seats, in log order, skipping forced ones only via `bucket`."""
+def iter_decisions(game: GameLog, seats, version: int = 4, select=None):
+    """Every can-act point of the given seats, in log order, skipping forced ones only via `bucket`.
+    `select(r, pos, seat) -> bool`, if given, limits which points are encoded and yielded (the replay itself
+    still runs over every event); training loaders use it to encode only the states they need."""
     lib = env.setup()
     PlayerState = lib.state.PlayerState
     seats = set(seats)
@@ -109,7 +111,7 @@ def iter_decisions(game: GameLog, seats, version: int = 4):
             cands = [ps[s].update(ln) for s in range(4)]
             for s in seats:
                 cans = cands[s]
-                if not cans.can_act:
+                if not cans.can_act or (select is not None and not select(r, j + 1, s)):
                     continue
                 p = ps[s]
                 obs, mask = p.encode_obs(version, False)
