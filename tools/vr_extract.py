@@ -42,11 +42,16 @@ from riichi_eval.protocol import placement_pt  # noqa: E402
 from riichi_eval.tiles import dora_of, is_aka, kind  # noqa: E402
 
 ADV = tuple(f"adv_{r}_s{b}_{'r' if rt else 'n'}" for r in ("ch", "opp") for b in range(4) for rt in (0, 1))
+# stage 3: the shanten-advance term in a finer lookup table (a bucketed value function is linear in these cells)
+CELLS = tuple(f"cell_{r}_s{b}_{'r' if rt else 'n'}_t{st}_v{v}_{'d' if dl else 'c'}"
+              for r in ("ch", "opp") for b in range(4) for rt in (0, 1) for st in range(3) for v in range(3)
+              for dl in (0, 1))
+DORA_CELLS = tuple(f"doracell_{r}_t{st}" for r in ("ch", "opp") for st in range(3))
 FEATURES = (
     "deal_shanten", "deal_dora", "deal_aka",
     "win_ch", "win_opp", "dora_ch", "dora_opp",
     "ura_ch_win", "ura_ch_dealin", "ura_opp_tsumo", "ura_opp_ron_other",
-    *ADV, "advval_ch", "advval_opp",
+    *ADV, "advval_ch", "advval_opp", *CELLS, *DORA_CELLS,
 )
 FI = {f: i for i, f in enumerate(FEATURES)}
 AKA_KIND = {4: 0, 13: 1, 22: 2}
@@ -74,6 +79,8 @@ def game_features(path: str):
         owned = np.zeros((4, 34), int)
         markers = []
         riichi = [False] * 4
+        ndisc = [0] * 4
+        oya = rd.oya
         last_discard = last_kakan = None
         prev_type = None
 
@@ -106,6 +113,8 @@ def game_features(path: str):
                 e_dora = (sum(unrev[k] for k in dk) + unrev_aka.sum()) / tot
                 h = sum(1 for k in dk if k == kind(tile)) + int(is_aka(tile))
                 x[FI["dora_" + role]] += h - e_dora
+                stage = 0 if ndisc[p] < 6 else (1 if ndisc[p] < 12 else 2)
+                x[FI[f"doracell_{role}_t{stage}"]] += h - e_dora
                 closed = np.frombuffer(bytes(ps[p].tehai), np.uint8).astype(np.int64)   # 34 closed-hand counts
                 n_closed = int(closed.sum())
                 if n_closed % 3 != 1:
@@ -116,12 +125,16 @@ def game_features(path: str):
                     term = float(adv[kind(tile)]) - unrev[adv].sum() / tot
                     rt = any(riichi[o] for o in range(4) if o != p)
                     x[FI[f"adv_{role}_s{min(int(before), 3)}_{'r' if rt else 'n'}"]] += term
+                    hand_dora = int(sum(owned[p, k] for k in dk)) + int(sum(bool(a) for a in ps[p].akas_in_hand))
                     if before <= 1:
-                        x[FI["advval_" + role]] += term * min(int(sum(owned[p, k] for k in dk)), 4)
+                        x[FI["advval_" + role]] += term * min(hand_dora, 4)
+                    x[FI[f"cell_{role}_s{min(int(before), 3)}_{'r' if rt else 'n'}_t{stage}_v{min(hand_dora, 2)}_"
+                         f"{'d' if p == oya else 'c'}"]] += term
                 take(tile)
                 owned[p, kind(tile)] += 1
             elif t == "dahai":
                 owned[int(ev["actor"]), kind(ev["pai"])] -= 1
+                ndisc[int(ev["actor"])] += 1
                 last_discard = ev["pai"]
             elif t in ("chi", "pon", "daiminkan"):
                 owned[int(ev["actor"]), kind(ev["pai"])] += 1
@@ -194,7 +207,7 @@ def main():
     rot = np.array([r[1] for r in rows], np.int8)
     ch = np.array([r[2] for r in rows], np.int8)
     y = np.array([r[3] for r in rows])
-    x = np.stack([r[4] for r in rows])
+    x = np.stack([r[4] for r in rows]).astype(np.float32)
     bad = np.array([r[5] for r in rows])
     np.savez_compressed(args.out, seed=seed, rot=rot, ch_seat=ch, y=y, x=x, bad=bad, features=np.array(FEATURES))
     print(f"-> {args.out}: {len(rows):,} games, {len(errors)} errors, {int((bad > 0).sum())} games with tile-count "
