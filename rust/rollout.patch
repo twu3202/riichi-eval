@@ -495,7 +495,7 @@ index 9fee2df..2021302 100644
                  }
              }
 diff --git a/libriichi/src/arena/mod.rs b/libriichi/src/arena/mod.rs
-index 880cf87..36f8def 100644
+index 880cf87..edddb4d 100644
 --- a/libriichi/src/arena/mod.rs
 +++ b/libriichi/src/arena/mod.rs
 @@ -2,6 +2,7 @@ mod board;
@@ -510,23 +510,24 @@ index 880cf87..36f8def 100644
  
  use crate::py_helper::add_submodule;
  use one_vs_three::OneVsThree;
-+use rollout::Rollout;
++use rollout::{Rollout, shanten_after_draw};
  use two_vs_two::TwoVsTwo;
  
  use pyo3::prelude::*;
-@@ -21,5 +23,6 @@ pub(crate) fn register_module(
+@@ -21,5 +23,7 @@ pub(crate) fn register_module(
      let m = PyModule::new(py, "arena")?;
      m.add_class::<OneVsThree>()?;
      m.add_class::<TwoVsTwo>()?;
 +    m.add_class::<Rollout>()?;
++    m.add_function(wrap_pyfunction!(shanten_after_draw, &m)?)?;
      add_submodule(py, prefix, super_mod, &m)
  }
 diff --git a/libriichi/src/arena/rollout.rs b/libriichi/src/arena/rollout.rs
 new file mode 100644
-index 0000000..6237ad6
+index 0000000..d7bf142
 --- /dev/null
 +++ b/libriichi/src/arena/rollout.rs
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,197 @@
 +//! Counterfactual rollouts for riichi-eval.
 +//!
 +//! Each spec restarts a logged game at the beginning of one kyoku (same seed,
@@ -704,4 +705,23 @@ index 0000000..6237ad6
 +                .collect()
 +        })
 +    }
++}
++
++/// Shanten of a closed hand (34 kind counts) and of that hand plus one more tile of each kind — the luck
++/// control variates in riichi-eval price every possible draw. `len_div3` = closed tile count / 3 before the
++/// draw (4 − number of melds). Kinds with no copy left return `i8::MAX`.
++#[pyfunction]
++pub fn shanten_after_draw(tiles: [u8; 34], len_div3: u8) -> (i8, [i8; 34]) {
++    let before = crate::algo::shanten::calc_all(&tiles, len_div3);
++    let mut after = [i8::MAX; 34];
++    let mut t = tiles;
++    for k in 0..34 {
++        if t[k] >= 4 {
++            continue;
++        }
++        t[k] += 1;
++        after[k] = crate::algo::shanten::calc_all(&t, len_div3);
++        t[k] -= 1;
++    }
++    (before, after)
 +}

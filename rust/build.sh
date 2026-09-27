@@ -12,5 +12,6 @@ patch -p1 --forward < "$HERE/rollout.patch"
 export PATH=$HOME/.cargo/bin:$PATH
 nice -n 10 cargo build --release --offline -p libriichi --lib
 mkdir -p "$OUT/pylib"
-cp target/release/libriichi.so "$OUT/pylib/libriichi.so"
+# copy then rename: processes that already loaded the old .so keep its inode instead of crashing
+cp target/release/libriichi.so "$OUT/pylib/libriichi.so.tmp" && mv -f "$OUT/pylib/libriichi.so.tmp" "$OUT/pylib/libriichi.so"
 echo "built $OUT/pylib/libriichi.so"
