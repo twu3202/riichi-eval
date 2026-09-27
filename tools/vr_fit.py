@@ -126,6 +126,8 @@ def main():
         "draws cells": [j for j in ok if feats[j].startswith(("win_", "cell_", "doracell_"))],
         "ura": [j for j in ok if feats[j].startswith("ura_")],
         "s2 all": [j for j in ok if not feats[j].startswith(("cell_", "doracell_"))],
+        # production set: stage 2 without win_* (near-duplicates of adv_*_s0, which makes the OLS weights explode)
+        "prod": [j for j in ok if not feats[j].startswith(("cell_", "doracell_", "win_"))],
         "all": ok,
     }
     for name, cols in subsets.items():
@@ -135,7 +137,7 @@ def main():
         r = Yc.var(ddof=1) / Y.var(ddof=1)
         print(f"   {name:<10} avg_pt {Yc.mean():+.4f} ± {ci(Yc):.4f}   var ratio {r:.3f}  "
               f"(= {1 / r:.2f}x games)   shift vs raw {Yc.mean() - Y.mean():+.4f}")
-        if name == "s2 all":
+        if name == "prod":
             for j, b in zip(cols, beta):
                 print(f"      beta {feats[j]:<20} {b:+9.3f}")
     if args.save_beta:

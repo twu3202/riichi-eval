@@ -29,3 +29,20 @@ paired and sequential statistics; a variance-reduced estimator; HTML reports; ex
 
 AGPL-3.0, because it links against libriichi (AGPL-3.0). No model weights, game logs or Tenhou-derived data
 (including GRP checkpoints trained on Tenhou logs) are part of this repository.
+
+## Variance reduction (luck control variates)
+
+Full-information 1v3 logs let every chance event be priced exactly: the four dealt hands are exchangeable across
+seats, every draw is uniform over the tiles not yet revealed, and so is every ura-dora indicator. Each correction
+term is `h(outcome) − E[h | history]`, so the corrected mean `mean(Y − β·C)` is unbiased for any weights β.
+
+    python tools/vr_extract.py --log-dir DIR [--log-dir ...] --out run.npz      # ~1,000 games/s on 8 cores
+    python tools/vr_fit.py run.npz --beta data/vr_beta_a2.npz [--pair other.npz]  # fixed weights, optional pairing
+
+`data/vr_beta_a2.npz` holds 27 weights fitted once on 1.07M duplicate games (A², v4b vs v4): dealt-hand terms,
+dora/red-five draws, shanten-advance draws by role × shanten × riichi-on-table, ura-dora by role.
+Measured: variance ratio 0.856 in-sample (10-fold cross-fitted), 0.846 when transferred unchanged to another
+model (tpt 408k, 72k games), 0.856 on a paired snapshot comparison — about 1.17× the games for free.
+All terms are checked for zero mean on every run (`vr_fit.py` excludes any that fail).
+Finer lookup tables (288 cells) add nothing; larger gains need a real value function over hypothetical draws,
+which costs more GPU time than simply playing more games.
