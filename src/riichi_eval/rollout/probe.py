@@ -52,7 +52,7 @@ class Candidate:
     r: int
     pos: int
     actor: int
-    kind: str          # "push2fold" | "riichi2dama" | "fold2push" | "dama2riichi"
+    kind: str          # "push2fold" | "riichi2dama" | "fold2push" | "dama2riichi" | "eff"
     ours: int
     alt: int
     margin: float
@@ -69,7 +69,28 @@ class Candidate:
 
 
 KINDS = ("push2fold", "riichi2dama")
-ALL_KINDS = ("push2fold", "riichi2dama", "fold2push", "dama2riichi")
+ALL_KINDS = ("push2fold", "riichi2dama", "fold2push", "dama2riichi", "eff")
+
+# "eff": a routine discard (no opponent riichi, riichi not legal) where we did not play the pure tile-efficiency
+# discard; the alternative is that discard. libriichi writes it into v4 observations as a one-hot row: among the
+# discards that keep shanten, the one with the most required tiles (ties by discard priority), i.e. classic
+# ukeire-max efficiency with no model involved. Present only when the single-player tables are computed.
+EFF_ROW = 959
+_KIND_OF = list(range(34)) + [4, 13, 22]
+_AKA = {4: 34, 13: 35, 22: 36}
+
+
+def eff_action(obs, mask):
+    """The legal discard action of the pure-efficiency choice, or None."""
+    row = obs[EFF_ROW]
+    k = np.flatnonzero(row > 0.5)
+    if len(k) != 1:
+        return None
+    k = int(k[0])
+    if mask[k]:
+        return k
+    a = _AKA.get(k)
+    return a if a is not None and mask[a] else None
 
 
 def find_candidates(games: list[GameLog], seats: list[int], engine, version: int = 4, batch: int = 4096,
@@ -114,6 +135,10 @@ def find_candidates(games: list[GameLog], seats: list[int], engine, version: int
                 add("fold2push", max(push, key=lambda a: qv[a]))
         if d.mask[37] and 0 <= d.logged <= 36 and "dama2riichi" in kinds:
             add("dama2riichi", 37)
+        if "eff" in kinds and 0 <= d.logged <= 36 and not d.exposed and not d.mask[37]:
+            a = eff_action(d.obs, d.mask)
+            if a is not None and _KIND_OF[a] != _KIND_OF[d.logged]:
+                add("eff", a)
     if ref_engine is not None and cdec:
         rq = []
         for s in range(0, len(cdec), batch):
@@ -125,7 +150,8 @@ def find_candidates(games: list[GameLog], seats: list[int], engine, version: int
             best = int(qv.argmax())
             c.ref_flip = {"riichi2dama": best != 37, "dama2riichi": best == 37,
                           "push2fold": d.push_fold(best) == "fold",
-                          "fold2push": d.push_fold(best) == "push"}[c.kind]
+                          "fold2push": d.push_fold(best) == "push",
+                          "eff": best <= 36 and _KIND_OF[best] == _KIND_OF[c.alt]}[c.kind]
             c.ref_margin = float(qv[c.ours] - qv[c.alt])
     return out, pc
 
