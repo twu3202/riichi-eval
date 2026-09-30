@@ -111,7 +111,7 @@ def main():
             for cd in priced:
                 row = {k: getattr(cd, k) for k in ("r", "pos", "actor", "kind", "ours", "alt", "margin",
                                                     "exposed", "shanten", "opened", "turn", "n_riichi", "dora",
-                                                    "ref_flip", "ref_margin")}
+                                                    "ref_flip", "ref_margin", "eff_sd", "eff_dk")}
                 row["seed"], row["rot"] = chunk[cd.game // 4][0], "abcd"[cd.game % 4]
                 if cd.alt_ev:
                     row.update({"d_grp": cd.alt_ev.get("grp"), "d_raw": cd.alt_ev.get("raw")})

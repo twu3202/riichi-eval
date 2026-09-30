@@ -66,6 +66,8 @@ class Candidate:
     alt_ev: dict | None = None
     ref_flip: bool | None = None     # the reference engine would not push / not riichi here either
     ref_margin: float | None = None  # Q_ref[ours] − Q_ref[alt]
+    eff_sd: bool | None = None       # "eff": our discard goes back in shanten while the efficiency discard does not
+    eff_dk: int | None = None        # "eff": required-tile kinds of the efficiency discard minus ours (same shanten)
 
 
 KINDS = ("push2fold", "riichi2dama")
@@ -76,6 +78,7 @@ ALL_KINDS = ("push2fold", "riichi2dama", "fold2push", "dama2riichi", "eff")
 # discards that keep shanten, the one with the most required tiles (ties by discard priority), i.e. classic
 # ukeire-max efficiency with no model involved. Present only when the single-player tables are computed.
 EFF_ROW = 959
+REQ_ROW = 891          # rows 891..924: tiles required after discarding kind k (shanten kept); 925..958: shanten down
 _KIND_OF = list(range(34)) + [4, 13, 22]
 _AKA = {4: 34, 13: 35, 22: 36}
 
@@ -139,6 +142,11 @@ def find_candidates(games: list[GameLog], seats: list[int], engine, version: int
             a = eff_action(d.obs, d.mask)
             if a is not None and _KIND_OF[a] != _KIND_OF[d.logged]:
                 add("eff", a)
+                if out and out[-1].kind == "eff" and out[-1].alt == a:
+                    ko, ke = _KIND_OF[d.logged], _KIND_OF[a]
+                    keep_o = bool(d.obs[REQ_ROW + ko].any())
+                    out[-1].eff_sd = bool(d.obs[REQ_ROW + 34 + ko].any())
+                    out[-1].eff_dk = int(d.obs[REQ_ROW + ke].sum() - d.obs[REQ_ROW + ko].sum()) if keep_o else None
     if ref_engine is not None and cdec:
         rq = []
         for s in range(0, len(cdec), batch):
