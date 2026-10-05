@@ -328,10 +328,14 @@ index 7a9ea7f..f8d31b4 100644
  pub use mortal::MortalBatchAgent;
  pub use py_agent::new_py_agent;
 diff --git a/libriichi/src/arena/game.rs b/libriichi/src/arena/game.rs
-index 9fee2df..2021302 100644
+index 9fee2df..f3c26f1 100644
 --- a/libriichi/src/arena/game.rs
 +++ b/libriichi/src/arena/game.rs
-@@ -5,7 +5,7 @@ use crate::mjai::EventExt;
+@@ -2,12 +2,15 @@ use super::board::{Board, BoardState, Poll};
+ use super::result::GameResult;
+ use crate::agent::BatchAgent;
+ use crate::mjai::EventExt;
++use crate::tile::Tile;
  use std::time::Duration;
  use std::{array, mem};
  
@@ -339,8 +343,12 @@ index 9fee2df..2021302 100644
 +use anyhow::{Context, Result, ensure};
  use indicatif::{ProgressBar, ProgressStyle};
  use ndarray::prelude::*;
++use rand::prelude::*;
++use rand_chacha::ChaCha12Rng;
  
-@@ -16,6 +16,29 @@ pub struct BatchGame {
+ pub struct BatchGame {
+     /// 8 for hanchan and 4 for tonpuu
+@@ -16,6 +19,80 @@ pub struct BatchGame {
      pub disable_progress_bar: bool,
  }
  
@@ -356,6 +364,57 @@ index 9fee2df..2021302 100644
 +    pub in_renchan: bool,
 +    /// End the game right after the first kyoku (round-horizon rollouts).
 +    pub stop_after_first_kyoku: bool,
++    /// Re-deal the tiles that are still hidden at the branch point of the
++    /// first kyoku (see `Reshuffle`); `None` keeps the logged wall.
++    pub reshuffle: Option<Reshuffle>,
++}
++
++/// Re-deal of the first kyoku's hidden tiles: every haipai stays as dealt and
++/// every tile already drawn or revealed before the branch stays in place; the
++/// rest of the live wall, the unused rinshan tiles, the unrevealed dora
++/// indicators and all ura indicators are shuffled among their own slots with
++/// `seed`. Given all four hands, the logged wall order is uniform over these
++/// permutations, so averaging rollouts over seeds averages over the wall only.
++#[derive(Clone, Copy, Default, Debug)]
++pub struct Reshuffle {
++    pub seed: u64,
++    /// Tiles popped from `yama` before the branch (non-rinshan tsumo events).
++    pub yama_drawn: usize,
++    /// Tiles popped from `rinshan` before the branch.
++    pub rinshan_drawn: usize,
++    /// Dora indicators revealed before the branch (1 + `dora` events).
++    pub dora_revealed: usize,
++}
++
++fn reshuffle_hidden(board: &mut Board, r: Reshuffle) -> Result<()> {
++    ensure!(
++        r.yama_drawn <= board.yama.len()
++            && r.rinshan_drawn <= board.rinshan.len()
++            && (1..=board.dora_indicators.len()).contains(&r.dora_revealed),
++        "reshuffle: bad prefix counts {r:?}",
++    );
++    // `yama`, `rinshan` and `dora_indicators` are popped from the back, so the
++    // drawn/revealed tiles are their last elements.
++    let ny = board.yama.len() - r.yama_drawn;
++    let nr = board.rinshan.len() - r.rinshan_drawn;
++    let nd = board.dora_indicators.len() - r.dora_revealed;
++    let mut hidden: Vec<Tile> = board.yama[..ny]
++        .iter()
++        .chain(&board.rinshan[..nr])
++        .chain(&board.dora_indicators[..nd])
++        .chain(&board.ura_indicators)
++        .copied()
++        .collect();
++    hidden.shuffle(&mut ChaCha12Rng::seed_from_u64(r.seed));
++    let slots = board.yama[..ny]
++        .iter_mut()
++        .chain(board.rinshan[..nr].iter_mut())
++        .chain(board.dora_indicators[..nd].iter_mut())
++        .chain(board.ura_indicators.iter_mut());
++    for (slot, tile) in slots.zip(hidden) {
++        *slot = tile;
++    }
++    Ok(())
 +}
 +
 +/// State right after the first kyoku of the game.
@@ -370,18 +429,19 @@ index 9fee2df..2021302 100644
  #[derive(Clone, Copy, Default)]
  pub struct Index {
      /// For `Game` to find a specific `Agent` (game -> agent).
-@@ -52,6 +75,10 @@ struct Game {
+@@ -52,6 +129,11 @@ struct Game {
      /// > サドンデスルールは、30000点(供託未収)以上になった時点で終了、ただし親の
      /// > 連荘がある場合は連荘を優先する
      in_renchan: bool,
 +
 +    stop_after_first_kyoku: bool,
++    reshuffle_first: Option<Reshuffle>,
 +    first_kyoku_end: Option<([i32; 4], u8)>,
 +    next_after_first: Option<(u8, u8)>,
  }
  
  impl Game {
-@@ -75,6 +102,14 @@ impl Game {
+@@ -75,6 +157,14 @@ impl Game {
                  return Ok(());
              }
  
@@ -396,7 +456,17 @@ index 9fee2df..2021302 100644
              let mut next_board = Board {
                  kyoku: self.kyoku,
                  honba: self.honba,
-@@ -126,6 +161,10 @@ impl Game {
+@@ -83,6 +173,9 @@ impl Game {
+                 ..Default::default()
+             };
+             next_board.init_from_seed(self.seed);
++            if let Some(r) = self.reshuffle_first.take() {
++                reshuffle_hidden(&mut next_board, r)?;
++            }
+             self.board = next_board.into_state();
+             self.kyoku_started = true;
+         }
+@@ -126,6 +219,10 @@ impl Game {
                  let logs = self.board.take_log();
                  self.game_log.push(logs);
  
@@ -407,7 +477,7 @@ index 9fee2df..2021302 100644
                  let has_tobi = self.scores.iter().any(|&s| s < 0);
                  if has_tobi {
                      self.ended = true;
-@@ -233,6 +272,19 @@ impl BatchGame {
+@@ -233,6 +330,19 @@ impl BatchGame {
          indexes: &[[Index; 4]],
          seeds: &[(u64, u64)],
      ) -> Result<Vec<GameResult>> {
@@ -427,7 +497,7 @@ index 9fee2df..2021302 100644
          ensure!(!agents.is_empty());
          ensure!(!indexes.is_empty());
          ensure!(
-@@ -241,6 +293,9 @@ impl BatchGame {
+@@ -241,6 +351,9 @@ impl BatchGame {
              indexes.len(),
              seeds.len(),
          );
@@ -437,7 +507,7 @@ index 9fee2df..2021302 100644
  
          let mut games = indexes
              .iter()
-@@ -253,7 +308,7 @@ impl BatchGame {
+@@ -253,7 +366,7 @@ impl BatchGame {
                      oracle_obs_versions[i] = agents[idx.agent_idx].oracle_obs_version();
                  }
  
@@ -446,7 +516,7 @@ index 9fee2df..2021302 100644
                      length: self.length,
                      seed,
                      indexes: *idxs,
-@@ -261,11 +316,19 @@ impl BatchGame {
+@@ -261,11 +374,20 @@ impl BatchGame {
                      oracle_obs_versions,
                      ..Default::default()
                  });
@@ -457,6 +527,7 @@ index 9fee2df..2021302 100644
 +                    game.scores = init.scores;
 +                    game.in_renchan = init.in_renchan;
 +                    game.stop_after_first_kyoku = init.stop_after_first_kyoku;
++                    game.reshuffle_first = init.reshuffle;
 +                }
                  Ok((game_idx, game))
              })
@@ -467,7 +538,7 @@ index 9fee2df..2021302 100644
          let mut to_remove = vec![];
          let mut cycles = 0;
          let mut actions = 0;
-@@ -284,13 +347,22 @@ impl BatchGame {
+@@ -284,13 +406,22 @@ impl BatchGame {
          bar.enable_steady_tick(Duration::from_millis(150));
  
          while !games.is_empty() {
@@ -524,17 +595,17 @@ index 880cf87..edddb4d 100644
  }
 diff --git a/libriichi/src/arena/rollout.rs b/libriichi/src/arena/rollout.rs
 new file mode 100644
-index 0000000..d7bf142
+index 0000000..ec02dd9
 --- /dev/null
 +++ b/libriichi/src/arena/rollout.rs
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,235 @@
 +//! Counterfactual rollouts for riichi-eval.
 +//!
 +//! Each spec restarts a logged game at the beginning of one kyoku (same seed,
 +//! hence the same wall), replays the logged reactions up to a branch point,
 +//! lets the branch actor play a replacement event, and continues with the
 +//! given engines until the end of that kyoku or of the game.
-+use super::game::{BatchGame, GameInit, Index};
++use super::game::{BatchGame, GameInit, Index, Reshuffle};
 +use crate::agent::{BatchAgent, Commit, ForcedPrefixAgent, RolloutScript, new_py_agent};
 +use crate::mjai::{Event, EventExt};
 +use std::sync::Arc;
@@ -567,6 +638,30 @@ index 0000000..d7bf142
 +    /// "" (none), "fold" or "dama": a macro-action the branch actor keeps to
 +    /// for the rest of the branch kyoku (see `Commit`).
 +    commit: String,
++    /// `None` = the logged wall; `Some(seed)` = re-deal the tiles still hidden
++    /// at the branch (see `Reshuffle`), hands and the replayed prefix unchanged.
++    reshuffle: Option<u64>,
++}
++
++/// (yama tiles drawn, rinshan tiles drawn, dora indicators revealed) in
++/// `reference[..pos]`: a tsumo right after a kan comes from the rinshan.
++fn prefix_draws(reference: &[Event], pos: usize) -> (usize, usize, usize) {
++    let (mut yama, mut rinshan, mut dora) = (0, 0, 0);
++    let mut after_kan = false;
++    for ev in &reference[..pos.min(reference.len())] {
++        match ev {
++            Event::StartKyoku { .. } => dora += 1,
++            Event::Dora { .. } => dora += 1,
++            Event::Ankan { .. } | Event::Kakan { .. } | Event::Daiminkan { .. } => after_kan = true,
++            Event::Tsumo { .. } if after_kan => {
++                rinshan += 1;
++                after_kan = false;
++            }
++            Event::Tsumo { .. } => yama += 1,
++            _ => (),
++        }
++    }
++    (yama, rinshan, dora)
 +}
 +
 +#[pyclass]
@@ -585,6 +680,9 @@ index 0000000..d7bf142
 +    /// Lets Python refuse a `commit` spec on a build that would ignore it.
 +    #[classattr]
 +    const SUPPORTS_COMMIT: bool = true;
++    /// Lets Python refuse a `reshuffle` spec on a build that would ignore it.
++    #[classattr]
++    const SUPPORTS_RESHUFFLE: bool = true;
 +
 +    #[new]
 +    #[pyo3(signature = (*, disable_progress_bar=true))]
@@ -642,6 +740,16 @@ index 0000000..d7bf142
 +                "dama" => Commit::Dama,
 +                c => bail!("spec #{i}: unknown commit {c}"),
 +            };
++            let reshuffle = spec.reshuffle.map(|seed| {
++                let (yama_drawn, rinshan_drawn, dora_revealed) =
++                    prefix_draws(&reference, spec.branch_pos);
++                Reshuffle {
++                    seed,
++                    yama_drawn,
++                    rinshan_drawn,
++                    dora_revealed,
++                }
++            });
 +            let script = Arc::new(RolloutScript {
 +                reference,
 +                branch_pos: spec.branch_pos,
@@ -669,6 +777,7 @@ index 0000000..d7bf142
 +                scores: spec.scores,
 +                in_renchan: spec.in_renchan,
 +                stop_after_first_kyoku,
++                reshuffle,
 +            });
 +        }
 +

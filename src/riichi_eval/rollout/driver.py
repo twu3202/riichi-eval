@@ -35,6 +35,8 @@ def run(engines: list, specs: list[dict], *, batch: int = 512, progress: bool = 
     Rollout = env.rollout_class()
     if any(s.get("commit") for s in specs) and not getattr(Rollout, "SUPPORTS_COMMIT", False):
         raise RuntimeError("this libriichi build predates `commit` and would silently ignore it; rebuild")
+    if any(s.get("reshuffle") is not None for s in specs) and not getattr(Rollout, "SUPPORTS_RESHUFFLE", False):
+        raise RuntimeError("this libriichi build predates `reshuffle` and would silently ignore it; rebuild")
     ro = Rollout(disable_progress_bar=not progress)
     out: list[RolloutResult | None] = [None] * len(specs)
 
