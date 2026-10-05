@@ -156,10 +156,12 @@ def find_candidates(games: list[GameLog], seats: list[int], engine, version: int
             qv = np.asarray(qv, np.float64)
             qv[~d.mask] = -np.inf
             best = int(qv.argmax())
-            c.ref_flip = {"riichi2dama": best != 37, "dama2riichi": best == 37,
-                          "push2fold": d.push_fold(best) == "fold",
-                          "fold2push": d.push_fold(best) == "push",
-                          "eff": best <= 36 and _KIND_OF[best] == _KIND_OF[c.alt]}[c.kind]
+            # evaluate only this candidate's kind: "eff" indexes _KIND_OF[c.alt], which is out of range for a
+            # riichi alternative (37)
+            c.ref_flip = {"riichi2dama": lambda: best != 37, "dama2riichi": lambda: best == 37,
+                          "push2fold": lambda: d.push_fold(best) == "fold",
+                          "fold2push": lambda: d.push_fold(best) == "push",
+                          "eff": lambda: best <= 36 and _KIND_OF[best] == _KIND_OF[c.alt]}[c.kind]()
             c.ref_margin = float(qv[c.ours] - qv[c.alt])
     return out, pc
 
