@@ -327,8 +327,21 @@ index 7a9ea7f..f8d31b4 100644
  pub use mjai_log::MjaiLogBatchAgent;
  pub use mortal::MortalBatchAgent;
  pub use py_agent::new_py_agent;
+diff --git a/libriichi/src/arena/board.rs b/libriichi/src/arena/board.rs
+index 5c52ab9..0d33d67 100644
+--- a/libriichi/src/arena/board.rs
++++ b/libriichi/src/arena/board.rs
+@@ -785,7 +785,7 @@ impl BoardState {
+ }
+ 
+ #[rustfmt::skip]
+-const UNSHUFFLED: [Tile; 136] = [
++pub(crate) const UNSHUFFLED: [Tile; 136] = [
+     t!(1m),  t!(1m), t!(1m), t!(1m),
+     t!(2m),  t!(2m), t!(2m), t!(2m),
+     t!(3m),  t!(3m), t!(3m), t!(3m),
 diff --git a/libriichi/src/arena/game.rs b/libriichi/src/arena/game.rs
-index 9fee2df..f3c26f1 100644
+index 9fee2df..cd2761b 100644
 --- a/libriichi/src/arena/game.rs
 +++ b/libriichi/src/arena/game.rs
 @@ -2,12 +2,15 @@ use super::board::{Board, BoardState, Poll};
@@ -348,14 +361,14 @@ index 9fee2df..f3c26f1 100644
  
  pub struct BatchGame {
      /// 8 for hanchan and 4 for tonpuu
-@@ -16,6 +19,80 @@ pub struct BatchGame {
+@@ -16,6 +19,95 @@ pub struct BatchGame {
      pub disable_progress_bar: bool,
  }
  
 +/// Start state for a game that does not begin at E1 with equal scores
 +/// (counterfactual rollouts). The wall of every kyoku still comes from the
 +/// game seed and (kyoku, honba), exactly as in a normal game.
-+#[derive(Clone, Copy, Default)]
++#[derive(Clone, Default)]
 +pub struct GameInit {
 +    pub kyoku: u8,
 +    pub honba: u8,
@@ -367,6 +380,21 @@ index 9fee2df..f3c26f1 100644
 +    /// Re-deal the tiles that are still hidden at the branch point of the
 +    /// first kyoku (see `Reshuffle`); `None` keeps the logged wall.
 +    pub reshuffle: Option<Reshuffle>,
++    /// The first kyoku's wall, replacing the one from the seed (logs that
++    /// carry no libriichi seed, e.g. human Tenhou games). Applied before
++    /// `reshuffle`.
++    pub wall: Option<Wall>,
++}
++
++/// A full wall in `Board`'s layout: `yama`, `rinshan` and `dora_indicators`
++/// are popped from the back, `ura_indicators` is read from the front.
++#[derive(Clone, Debug)]
++pub struct Wall {
++    pub haipai: [[Tile; 13]; 4],
++    pub yama: Vec<Tile>,
++    pub rinshan: Vec<Tile>,
++    pub dora_indicators: Vec<Tile>,
++    pub ura_indicators: Vec<Tile>,
 +}
 +
 +/// Re-deal of the first kyoku's hidden tiles: every haipai stays as dealt and
@@ -429,19 +457,20 @@ index 9fee2df..f3c26f1 100644
  #[derive(Clone, Copy, Default)]
  pub struct Index {
      /// For `Game` to find a specific `Agent` (game -> agent).
-@@ -52,6 +129,11 @@ struct Game {
+@@ -52,6 +144,12 @@ struct Game {
      /// > サドンデスルールは、30000点(供託未収)以上になった時点で終了、ただし親の
      /// > 連荘がある場合は連荘を優先する
      in_renchan: bool,
 +
 +    stop_after_first_kyoku: bool,
 +    reshuffle_first: Option<Reshuffle>,
++    wall_first: Option<Wall>,
 +    first_kyoku_end: Option<([i32; 4], u8)>,
 +    next_after_first: Option<(u8, u8)>,
  }
  
  impl Game {
-@@ -75,6 +157,14 @@ impl Game {
+@@ -75,6 +173,14 @@ impl Game {
                  return Ok(());
              }
  
@@ -456,17 +485,24 @@ index 9fee2df..f3c26f1 100644
              let mut next_board = Board {
                  kyoku: self.kyoku,
                  honba: self.honba,
-@@ -83,6 +173,9 @@ impl Game {
+@@ -83,6 +189,16 @@ impl Game {
                  ..Default::default()
              };
              next_board.init_from_seed(self.seed);
++            if let Some(w) = self.wall_first.take() {
++                next_board.haipai = w.haipai;
++                next_board.yama = w.yama;
++                next_board.rinshan = w.rinshan;
++                next_board.dora_indicators = w.dora_indicators;
++                next_board.ura_indicators = w.ura_indicators;
++            }
 +            if let Some(r) = self.reshuffle_first.take() {
 +                reshuffle_hidden(&mut next_board, r)?;
 +            }
              self.board = next_board.into_state();
              self.kyoku_started = true;
          }
-@@ -126,6 +219,10 @@ impl Game {
+@@ -126,6 +242,10 @@ impl Game {
                  let logs = self.board.take_log();
                  self.game_log.push(logs);
  
@@ -477,7 +513,7 @@ index 9fee2df..f3c26f1 100644
                  let has_tobi = self.scores.iter().any(|&s| s < 0);
                  if has_tobi {
                      self.ended = true;
-@@ -233,6 +330,19 @@ impl BatchGame {
+@@ -233,6 +353,19 @@ impl BatchGame {
          indexes: &[[Index; 4]],
          seeds: &[(u64, u64)],
      ) -> Result<Vec<GameResult>> {
@@ -497,7 +533,7 @@ index 9fee2df..f3c26f1 100644
          ensure!(!agents.is_empty());
          ensure!(!indexes.is_empty());
          ensure!(
-@@ -241,6 +351,9 @@ impl BatchGame {
+@@ -241,6 +374,9 @@ impl BatchGame {
              indexes.len(),
              seeds.len(),
          );
@@ -507,7 +543,7 @@ index 9fee2df..f3c26f1 100644
  
          let mut games = indexes
              .iter()
-@@ -253,7 +366,7 @@ impl BatchGame {
+@@ -253,7 +389,7 @@ impl BatchGame {
                      oracle_obs_versions[i] = agents[idx.agent_idx].oracle_obs_version();
                  }
  
@@ -516,11 +552,11 @@ index 9fee2df..f3c26f1 100644
                      length: self.length,
                      seed,
                      indexes: *idxs,
-@@ -261,11 +374,20 @@ impl BatchGame {
+@@ -261,11 +397,21 @@ impl BatchGame {
                      oracle_obs_versions,
                      ..Default::default()
                  });
-+                if let Some(init) = inits.map(|v| v[game_idx]) {
++                if let Some(init) = inits.map(|v| v[game_idx].clone()) {
 +                    game.kyoku = init.kyoku;
 +                    game.honba = init.honba;
 +                    game.kyotaku = init.kyotaku;
@@ -528,6 +564,7 @@ index 9fee2df..f3c26f1 100644
 +                    game.in_renchan = init.in_renchan;
 +                    game.stop_after_first_kyoku = init.stop_after_first_kyoku;
 +                    game.reshuffle_first = init.reshuffle;
++                    game.wall_first = init.wall;
 +                }
                  Ok((game_idx, game))
              })
@@ -538,7 +575,7 @@ index 9fee2df..f3c26f1 100644
          let mut to_remove = vec![];
          let mut cycles = 0;
          let mut actions = 0;
-@@ -284,13 +406,22 @@ impl BatchGame {
+@@ -284,13 +430,22 @@ impl BatchGame {
          bar.enable_steady_tick(Duration::from_millis(150));
  
          while !games.is_empty() {
@@ -595,17 +632,24 @@ index 880cf87..edddb4d 100644
  }
 diff --git a/libriichi/src/arena/rollout.rs b/libriichi/src/arena/rollout.rs
 new file mode 100644
-index 0000000..ec02dd9
+index 0000000..797b2fb
 --- /dev/null
 +++ b/libriichi/src/arena/rollout.rs
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,307 @@
 +//! Counterfactual rollouts for riichi-eval.
 +//!
 +//! Each spec restarts a logged game at the beginning of one kyoku (same seed,
 +//! hence the same wall), replays the logged reactions up to a branch point,
 +//! lets the branch actor play a replacement event, and continues with the
 +//! given engines until the end of that kyoku or of the game.
-+use super::game::{BatchGame, GameInit, Index, Reshuffle};
++//!
++//! A log without a libriichi seed (a human Tenhou game) passes its kyoku's
++//! wall instead (`wall`): the hands, the logged draws and the revealed dora
++//! indicators in place, the tiles never seen anywhere else; with `reshuffle`
++//! the unseen part is then re-dealt, which is all the wall a log can tell.
++use super::board::UNSHUFFLED;
++use super::game::{BatchGame, GameInit, Index, Reshuffle, Wall};
++use crate::tile::Tile;
 +use crate::agent::{BatchAgent, Commit, ForcedPrefixAgent, RolloutScript, new_py_agent};
 +use crate::mjai::{Event, EventExt};
 +use std::sync::Arc;
@@ -641,6 +685,61 @@ index 0000000..ec02dd9
 +    /// `None` = the logged wall; `Some(seed)` = re-deal the tiles still hidden
 +    /// at the branch (see `Reshuffle`), hands and the replayed prefix unchanged.
 +    reshuffle: Option<u64>,
++    /// `None` = the wall comes from `seed`; otherwise the first kyoku's wall
++    /// as (haipai 4 x 13, yama 70, rinshan 4, dora indicators 5, ura
++    /// indicators 5) in mjai tile names, in `Board`'s layout (see `Wall`).
++    #[allow(clippy::type_complexity)]
++    wall: Option<(Vec<Vec<String>>, Vec<String>, Vec<String>, Vec<String>, Vec<String>)>,
++}
++
++#[allow(clippy::type_complexity)]
++fn parse_wall(
++    w: &(Vec<Vec<String>>, Vec<String>, Vec<String>, Vec<String>, Vec<String>),
++) -> Result<Wall> {
++    let tiles = |v: &[String]| -> Result<Vec<Tile>> {
++        v.iter()
++            .map(|t| t.parse::<Tile>().map_err(|e| anyhow::anyhow!("bad tile {t}: {e:?}")))
++            .collect()
++    };
++    let (hands, yama, rinshan, dora, ura) = w;
++    ensure!(hands.len() == 4, "wall: {} hands", hands.len());
++    let mut haipai = [[Tile::default(); 13]; 4];
++    for (h, src) in haipai.iter_mut().zip(hands) {
++        let v = tiles(src)?;
++        ensure!(v.len() == 13, "wall: a hand of {} tiles", v.len());
++        h.copy_from_slice(&v);
++    }
++    let wall = Wall {
++        haipai,
++        yama: tiles(yama)?,
++        rinshan: tiles(rinshan)?,
++        dora_indicators: tiles(dora)?,
++        ura_indicators: tiles(ura)?,
++    };
++    ensure!(
++        (wall.yama.len(), wall.rinshan.len(), wall.dora_indicators.len(), wall.ura_indicators.len())
++            == (70, 4, 5, 5),
++        "wall: yama/rinshan/dora/ura lengths {}/{}/{}/{}, expected 70/4/5/5",
++        wall.yama.len(),
++        wall.rinshan.len(),
++        wall.dora_indicators.len(),
++        wall.ura_indicators.len(),
++    );
++    let mut got: Vec<u8> = wall
++        .haipai
++        .iter()
++        .flatten()
++        .chain(&wall.yama)
++        .chain(&wall.rinshan)
++        .chain(&wall.dora_indicators)
++        .chain(&wall.ura_indicators)
++        .map(|t| t.as_u8())
++        .collect();
++    let mut want: Vec<u8> = UNSHUFFLED.iter().map(|t| t.as_u8()).collect();
++    got.sort_unstable();
++    want.sort_unstable();
++    ensure!(got == want, "wall: not the 136-tile set");
++    Ok(wall)
 +}
 +
 +/// (yama tiles drawn, rinshan tiles drawn, dora indicators revealed) in
@@ -683,6 +782,9 @@ index 0000000..ec02dd9
 +    /// Lets Python refuse a `reshuffle` spec on a build that would ignore it.
 +    #[classattr]
 +    const SUPPORTS_RESHUFFLE: bool = true;
++    /// Lets Python refuse a `wall` spec on a build that would ignore it.
++    #[classattr]
++    const SUPPORTS_WALL: bool = true;
 +
 +    #[new]
 +    #[pyo3(signature = (*, disable_progress_bar=true))]
@@ -750,6 +852,12 @@ index 0000000..ec02dd9
 +                    dora_revealed,
 +                }
 +            });
++            let wall = spec
++                .wall
++                .as_ref()
++                .map(parse_wall)
++                .transpose()
++                .with_context(|| format!("spec #{i}"))?;
 +            let script = Arc::new(RolloutScript {
 +                reference,
 +                branch_pos: spec.branch_pos,
@@ -778,6 +886,7 @@ index 0000000..ec02dd9
 +                in_renchan: spec.in_renchan,
 +                stop_after_first_kyoku,
 +                reshuffle,
++                wall,
 +            });
 +        }
 +
